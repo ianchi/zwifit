@@ -7,12 +7,15 @@ from bleak import BleakScanner
 
 @dataclass(frozen=True)
 class IFitDevice:
+    """Metadata for a discovered iFit device."""
+
     address: str
     name: str | None
     manufacturer_data: bytes
 
 
 def _normalize_ble_code(code: str) -> str:
+    """Normalize and validate a 4-character BLE code."""
     cleaned = code.strip().lower()
     if len(cleaned) != 4 or any(c not in "0123456789abcdef" for c in cleaned):
         raise ValueError("BLE code must be a 4-character hex string")
@@ -20,9 +23,11 @@ def _normalize_ble_code(code: str) -> str:
 
 
 async def find_ifit_device(code: str, timeout: float = 10.0) -> IFitDevice:
+    """Scan for an iFit device matching the displayed BLE code."""
     normalized = _normalize_ble_code(code)
     suffix = bytes.fromhex(f"dd{normalized}")
 
+    # Manufacturer data suffix matches the BLE code shown on the equipment.
     devices = await BleakScanner.discover(timeout=timeout)
     for device in devices:
         if not device.metadata:
