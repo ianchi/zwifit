@@ -101,6 +101,7 @@ def encode_supported_incline_range(ranges: FtmsRanges) -> bytes:
 
 
 def _u16_or_unknown(value: float | None, scale: float, unknown: int) -> int:
+    """Scale a value into uint16 or return the FTMS unknown sentinel."""
     if value is None:
         return unknown
     raw = int(round(value * scale))
@@ -108,6 +109,7 @@ def _u16_or_unknown(value: float | None, scale: float, unknown: int) -> int:
 
 
 def _s16_or_unknown(value: float | None, scale: float, unknown: int) -> int:
+    """Scale a value into sint16 or return the FTMS unknown sentinel."""
     if value is None:
         return unknown
     raw = int(round(value * scale))
@@ -123,6 +125,7 @@ def encode_treadmill_data(
 ) -> bytes:
     """Encode treadmill data with optional incline, distance, and heart rate."""
     flags = 0
+    # Signal that additional fields may follow.
     flags |= TREADMILL_FLAG_MORE_DATA
 
     speed_raw = _u16_or_unknown(speed_kph, 100.0, 0xFFFF)

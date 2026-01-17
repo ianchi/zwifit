@@ -58,6 +58,7 @@ class FtmsBleRelay:
         *,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
+        """Initialize relay state and BLE characteristics."""
         self._client = client
         self._config = config
         self._ranges = ranges or FtmsRanges()
@@ -91,6 +92,7 @@ class FtmsBleRelay:
         LOGGER.info("FTMS server stopped")
 
     def _init_gatt(self) -> None:
+        """Register GATT characteristics and request handlers."""
         treadmill_data = BlessGATTCharacteristic(
             TREADMILL_DATA_UUID,
             GATTCharacteristicProperties.notify,
@@ -144,6 +146,7 @@ class FtmsBleRelay:
         self._server.write_request_func = self._write_request
 
     def _read_request(self, characteristic: BlessGATTCharacteristic) -> bytes:
+        """Return the current cached value for the requested characteristic."""
         if characteristic.uuid == FITNESS_MACHINE_FEATURE_UUID:
             return self._feature_value
         if characteristic.uuid == FITNESS_MACHINE_STATUS_UUID:
@@ -159,6 +162,7 @@ class FtmsBleRelay:
         return b""
 
     def _write_request(self, characteristic: BlessGATTCharacteristic, value: bytes) -> bool:
+        """Handle FTMS control point writes for speed/incline targets."""
         if characteristic.uuid != FITNESS_MACHINE_CONTROL_POINT_UUID:
             return False
         if not value:
@@ -176,6 +180,7 @@ class FtmsBleRelay:
                 op = None
             match op:
                 case ControlPointOpcode.REQUEST_CONTROL:
+                    # Always grant control to the FTMS client.
                     self._send_control_point_response(opcode, result=ControlPointResult.SUCCESS)
                     return True
                 case ControlPointOpcode.SET_TARGET_SPEED:
@@ -205,6 +210,7 @@ class FtmsBleRelay:
             return False
 
     def _handle_target_speed(self, opcode: int, value: bytes) -> bool:
+        """Parse a speed target request and forward it to the iFit client."""
         if len(value) < 3:
             self._send_control_point_response(
                 opcode,
@@ -213,12 +219,14 @@ class FtmsBleRelay:
             return False
         (raw,) = unpack("<H", value[1:3])
         kph = raw / 100
+        # Convert FTMS 0.01 km/h units to kph.
         LOGGER.info("Setting target speed to %.2f kph", kph)
         self._schedule_task(self._client.write_characteristics({"Kph": kph}), "set_speed")
         self._send_control_point_response(opcode, result=ControlPointResult.SUCCESS)
         return True
 
     def _handle_target_incline(self, opcode: int, value: bytes) -> bool:
+        """Parse an incline target request and forward it to the iFit client."""
         if len(value) < 3:
             self._send_control_point_response(
                 opcode,
@@ -227,6 +235,7 @@ class FtmsBleRelay:
             return False
         (raw,) = unpack("<h", value[1:3])
         incline = raw / 10
+        # Convert FTMS 0.1% units to incline percentage.
         LOGGER.info("Setting target incline to %.1f", incline)
         self._schedule_task(self._client.write_characteristics({"Incline": incline}), "set_incline")
         self._send_control_point_response(opcode, result=ControlPointResult.SUCCESS)
@@ -238,17 +247,20 @@ class FtmsBleRelay:
         *,
         result: ControlPointResult,
     ) -> None:
+        """Send a control point response via indication."""
         payload = encode_control_point_response(opcode, result)
         self._control_point_value = payload
         self._server.get_characteristic(FITNESS_MACHINE_CONTROL_POINT_UUID).value = payload
         self._server.update_value(FTMS_SERVICE_UUID, FITNESS_MACHINE_CONTROL_POINT_UUID)
 
     def _schedule_task(self, coro: Coroutine[object, object, None], label: str) -> None:
+        """Schedule a background task and log failures."""
         task = self._loop.create_task(coro)
         task.add_done_callback(lambda t: self._log_task_exception(t, label))
 
     @staticmethod
     def _log_task_exception(task: asyncio.Future[None], label: str) -> None:
+        """Log exceptions from background tasks."""
         if task.cancelled():
             return
         exc = task.exception()
@@ -256,11 +268,13 @@ class FtmsBleRelay:
             LOGGER.error("Background task %s failed: %s", label, exc)
 
     async def _notify_loop(self) -> None:
+        """Continuously poll the iFit client and notify FTMS subscribers."""
         while True:
             await self._update_treadmill_data()
             await asyncio.sleep(self._config.update_interval)
 
     async def _update_treadmill_data(self) -> None:
+        """Read iFit values and update FTMS treadmill/status characteristics."""
         values = await self._client.read_characteristics(
             ["CurrentKph", "CurrentIncline", "Distance", "Pulse", "Mode"]
         )
@@ -271,6 +285,7 @@ class FtmsBleRelay:
         heart_rate = int(pulse_data.get("pulse", 0)) if isinstance(pulse_data, dict) else 0
         mode = values.get("Mode")
 
+        # Compose FTMS treadmill data with optional fields for incline/distance/hr.
         self._treadmill_value = encode_treadmill_data(
             speed_kph=current_kph,
             incline_percent=current_incline,
@@ -288,6 +303,7 @@ class FtmsBleRelay:
 
     @staticmethod
     def _build_feature_value() -> bytes:
+        """Build the FTMS feature bitfield payload."""
         return encode_fitness_machine_feature(
             supports_inclination=True,
             supports_speed_target=True,
@@ -295,6 +311,7 @@ class FtmsBleRelay:
         )
 
     def _update_ranges_from_equipment(self) -> None:
+        """Update supported ranges based on the iFit equipment metadata."""
         info = self._client.equipment_information
         if not info:
             return
@@ -321,6 +338,7 @@ class FtmsBleRelay:
 
     @staticmethod
     def _encode_status_from_mode(mode: object) -> bytes | None:
+        """Map iFit mode values to FTMS status messages."""
         if isinstance(mode, Mode):
             if mode == Mode.ACTIVE:
                 return encode_status_started()

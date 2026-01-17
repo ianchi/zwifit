@@ -9,11 +9,15 @@ MAX_BYTES_PER_MESSAGE = 18
 
 
 class SportsEquipment(IntEnum):
+    """Sports equipment identifiers used by the iFit protocol."""
+
     GENERAL = 2
     TREADMILL = 4
 
 
 class PulseSource(IntEnum):
+    """Pulse source identifiers reported by the equipment."""
+
     NO = 0
     HAND = 1
     UNKNOWN = 2
@@ -22,6 +26,8 @@ class PulseSource(IntEnum):
 
 
 class Mode(IntEnum):
+    """Equipment mode identifiers."""
+
     UNKNOWN = 0
     IDLE = 1
     ACTIVE = 2
@@ -32,6 +38,8 @@ class Mode(IntEnum):
 
 
 class Command(IntEnum):
+    """Command identifiers used in request headers."""
+
     WRITE_AND_READ = 2
     CALIBRATE = 6
     SUPPORTED_CAPABILITIES = 128
@@ -44,12 +52,16 @@ class Command(IntEnum):
 
 
 class MessageIndex(IntEnum):
+    """Chunk index markers for BLE message framing."""
+
     HEADER = 0xFE
     EOF = 0xFF
 
 
 @dataclass(frozen=True)
 class Converter:
+    """Converter describing buffer encoding/decoding for a characteristic."""
+
     size: int
     from_buffer: Callable[[bytes, int], Any]
     to_buffer: Callable[[bytearray, int, Any], int]
@@ -57,6 +69,8 @@ class Converter:
 
 @dataclass(frozen=True)
 class CharacteristicDefinition:
+    """Definition of a characteristic and its converter."""
+
     name: str
     id: int
     read_only: bool
@@ -65,12 +79,16 @@ class CharacteristicDefinition:
 
 @dataclass(frozen=True)
 class CapabilityDefinition:
+    """Definition of a high-level capability and its characteristic id."""
+
     id: int
     characteristic_id: int
 
 
 @dataclass
 class EquipmentInformation:
+    """Stateful equipment metadata and current values."""
+
     equipment: SportsEquipment
     characteristics: dict[int, CharacteristicDefinition]
     supported_capabilities: list[int] = field(default_factory=list)
@@ -79,68 +97,83 @@ class EquipmentInformation:
 
 @dataclass(frozen=True)
 class WriteValue:
+    """Represents a write request for a single characteristic."""
+
     characteristic: CharacteristicDefinition
     value: Any
 
 
 def _double_from_buffer(buffer: bytes, pos: int) -> float:
+    """Decode a scaled uint16 (two decimals) from the buffer."""
     return int.from_bytes(buffer[pos : pos + 2], "little") / 100
 
 
 def _double_to_buffer(buffer: bytearray, pos: int, value: float) -> int:
+    """Encode a scaled uint16 (two decimals) into the buffer."""
     scaled = round(value * 100)
     buffer[pos : pos + 2] = int(scaled).to_bytes(2, "little")
     return pos + 2
 
 
 def _bool_from_buffer(buffer: bytes, pos: int) -> bool:
+    """Decode a boolean flag."""
     return buffer[pos] == 1
 
 
 def _bool_to_buffer(buffer: bytearray, pos: int, value: bool) -> int:
+    """Encode a boolean flag."""
     buffer[pos] = 1 if value else 0
     return pos + 1
 
 
 def _uint8_from_buffer(buffer: bytes, pos: int) -> int:
+    """Decode a uint8."""
     return buffer[pos]
 
 
 def _uint8_to_buffer(buffer: bytearray, pos: int, value: int) -> int:
+    """Encode a uint8."""
     buffer[pos] = int(value) & 0xFF
     return pos + 1
 
 
 def _uint16_from_buffer(buffer: bytes, pos: int) -> int:
+    """Decode a uint16."""
     return int.from_bytes(buffer[pos : pos + 2], "little")
 
 
 def _uint16_to_buffer(buffer: bytearray, pos: int, value: int) -> int:
+    """Encode a uint16."""
     buffer[pos : pos + 2] = int(value).to_bytes(2, "little")
     return pos + 2
 
 
 def _uint32_from_buffer(buffer: bytes, pos: int) -> int:
+    """Decode a uint32."""
     return int.from_bytes(buffer[pos : pos + 4], "little")
 
 
 def _uint32_to_buffer(buffer: bytearray, pos: int, value: int) -> int:
+    """Encode a uint32."""
     buffer[pos : pos + 4] = int(value).to_bytes(4, "little")
     return pos + 4
 
 
 def _calories_from_buffer(buffer: bytes, pos: int) -> float:
+    """Decode calories using the iFit scaling factor."""
     raw = int.from_bytes(buffer[pos : pos + 4], "little")
     return raw * 1024 / 100000000
 
 
 def _calories_to_buffer(buffer: bytearray, pos: int, value: float) -> int:
+    """Encode calories using the iFit scaling factor."""
     raw = int(value * 100000000 / 1024)
     buffer[pos : pos + 4] = raw.to_bytes(4, "little")
     return pos + 4
 
 
 def _pulse_from_buffer(buffer: bytes, pos: int) -> dict[str, Any]:
+    """Decode pulse data including source information."""
     pulse = buffer[pos]
     average = buffer[pos + 1]
     count = buffer[pos + 2]
@@ -149,6 +182,7 @@ def _pulse_from_buffer(buffer: bytes, pos: int) -> dict[str, Any]:
 
 
 def _pulse_to_buffer(buffer: bytearray, pos: int, value: Mapping[str, Any]) -> int:
+    """Encode pulse data; only pulse and source are used."""
     pulse = int(value.get("pulse", 0))
     source = PulseSource(value.get("source", PulseSource.NO))
     buffer[pos] = pulse & 0xFF
@@ -236,6 +270,7 @@ def get_bitmap(
     equipment_information: EquipmentInformation,
     values: Iterable[CharacteristicDefinition | WriteValue] | None,
 ) -> bytearray:
+    """Build a bitmap of characteristic ids used in a request."""
     payload = bytearray([0])
     if values is None:
         return payload
@@ -244,6 +279,7 @@ def get_bitmap(
         characteristic = (
             item.characteristic if isinstance(item, WriteValue) else item
         )
+        # Only include characteristics supported by the connected equipment.
         if characteristic.id not in equipment_information.characteristics:
             continue
         pos = (characteristic.id // 8) + 1
@@ -261,6 +297,7 @@ def get_bitmap(
 
 
 def get_write_values(writes: Iterable[WriteValue] | None) -> bytearray | None:
+    """Encode write values in ascending characteristic id order."""
     if not writes:
         return None
 
@@ -272,6 +309,7 @@ def get_write_values(writes: Iterable[WriteValue] | None) -> bytearray | None:
 
     payload = bytearray(size)
     pos = 0
+    # iFit expects values ordered by characteristic id.
     for write in sorted(writes_list, key=lambda item: item.characteristic.id):
         converter = write.characteristic.converter
         if converter:
@@ -283,14 +321,18 @@ def get_write_values(writes: Iterable[WriteValue] | None) -> bytearray | None:
 
 
 def build_request(
-    equipment: SportsEquipment, command: Command, payload: bytes | None = None
+    equipment: SportsEquipment | int,
+    command: Command | int,
+    payload: bytes | None = None,
 ) -> bytes:
+    """Build the raw request payload for a command."""
     payload = payload or b""
     length = len(payload) + 4
     buf = bytearray(length + 4)
 
     checksum = int(equipment) + length + int(command)
 
+    # Fixed header prefix used by iFit equipment.
     pos = 0
     buf[pos] = 2
     pos += 1
@@ -310,11 +352,13 @@ def build_request(
         checksum += byte
         buf[pos] = byte
         pos += 1
+    # Checksum is the low byte of the sum of header fields and payload bytes.
     buf[pos] = checksum & 0xFF
     return bytes(buf)
 
 
 def request_header(request: bytes, number_of_writes: int) -> bytes:
+    """Build the BLE header chunk for a framed request."""
     buf = bytearray(4)
     buf[0] = MessageIndex.HEADER
     buf[1] = 2
@@ -324,6 +368,7 @@ def request_header(request: bytes, number_of_writes: int) -> bytes:
 
 
 def build_write_messages(request: bytes) -> list[bytes]:
+    """Split a request into BLE chunks (header + payload fragments)."""
     number_of_writes = (len(request) + MAX_BYTES_PER_MESSAGE - 1) // MAX_BYTES_PER_MESSAGE
     messages = [request_header(request, number_of_writes)]
 
@@ -337,6 +382,7 @@ def build_write_messages(request: bytes) -> list[bytes]:
             if counter < number_of_writes
             else ((len(request) - 1) % MAX_BYTES_PER_MESSAGE + 1)
         )
+        # First byte is the chunk index (or EOF for the final chunk).
         message[0] = counter - 1
         message[1] = length
         message[2 : 2 + length] = request[offset : offset + length]
@@ -353,12 +399,14 @@ def build_write_messages(request: bytes) -> list[bytes]:
 
 
 def determine_message_index(message: bytes) -> int:
+    """Return the chunk index byte from a BLE message."""
     if len(message) < 1:
         raise ValueError(f"unexpected message format: {message.hex()}")
     return message[0]
 
 
 def get_header_from_response(message: bytes) -> tuple[int, bytearray]:
+    """Parse the response header chunk and return expected count + buffer."""
     if len(message) < 4:
         raise ValueError("unexpected message format - four bytes expected")
     if message[0] != MessageIndex.HEADER:
@@ -372,6 +420,7 @@ def get_header_from_response(message: bytes) -> tuple[int, bytearray]:
 
 
 def fill_response(buffer: bytearray, number_of_reads: int, message: bytes) -> None:
+    """Copy a response chunk into the buffer based on its index."""
     if buffer is None:
         raise ValueError("undefined buffer")
     if len(message) < 2:
@@ -383,6 +432,7 @@ def fill_response(buffer: bytearray, number_of_reads: int, message: bytes) -> No
             f"index of message exceeds number of expected reads: {index}>={number_of_reads}"
         )
 
+    # Map the chunk index to its offset in the full response buffer.
     pos = (number_of_reads - 1 if index == MessageIndex.EOF else index) * 18
     length = message[1]
     if length + pos > len(buffer):
@@ -392,7 +442,10 @@ def fill_response(buffer: bytearray, number_of_reads: int, message: bytes) -> No
     buffer[pos : pos + length] = message[2 : 2 + length]
 
 
-def parse_command_header(response: bytes, expected_command: Command) -> dict[str, Any]:
+def parse_command_header(
+    response: bytes, expected_command: Command | int
+) -> dict[str, Any]:
+    """Validate and parse the command response header."""
     if len(response) < 4:
         raise ValueError("unexpected buffer length - must be greater than 4 bytes")
     length = response[3]
@@ -407,8 +460,10 @@ def parse_command_header(response: bytes, expected_command: Command) -> dict[str
     pos += 1
     command = response[pos]
     pos += 1
-    if command != expected_command:
-        raise ValueError(f"expected command {expected_command} but got {command}")
+    if command != int(expected_command):
+        raise ValueError(
+            f"expected command {int(expected_command)} but got {command}"
+        )
     status = response[pos]
     if status != RESPONSE_OK_CODE:
         raise ValueError(f"response code not OK: {status}")
@@ -416,6 +471,7 @@ def parse_command_header(response: bytes, expected_command: Command) -> dict[str
 
 
 def parse_equipment_information_response(response: bytes) -> dict[int, CharacteristicDefinition]:
+    """Parse equipment information and return supported characteristics."""
     pos = 16
     length = response[pos]
     pos += 1
@@ -434,6 +490,7 @@ def parse_equipment_information_response(response: bytes) -> dict[int, Character
 
 
 def parse_features_response(response: bytes) -> list[int]:
+    """Parse a list of supported feature ids from a response."""
     pos = 8
     count = response[pos]
     pos += 1
@@ -449,6 +506,7 @@ def parse_write_and_read_response(
     response: bytes,
     reads: Iterable[CharacteristicDefinition],
 ) -> dict[str, Any]:
+    """Parse read values from a write-and-read response."""
     result: dict[str, Any] = {}
     read_list = sorted(reads, key=lambda item: item.id)
 
