@@ -92,6 +92,7 @@ class EquipmentInformation:
     equipment: SportsEquipment
     characteristics: dict[int, CharacteristicDefinition]
     supported_capabilities: list[int] = field(default_factory=list)
+    supported_commands: list[int] = field(default_factory=list)
     values: dict[str, Any] = field(default_factory=dict)
 
 
@@ -491,9 +492,18 @@ def parse_equipment_information_response(response: bytes) -> dict[int, Character
 
 def parse_features_response(response: bytes) -> list[int]:
     """Parse a list of supported feature ids from a response."""
+    if len(response) < 9:
+        # Response too short, return empty list
+        return []
     pos = 8
     count = response[pos]
     pos += 1
+    
+    # Validate we have enough data for all expected items
+    if len(response) < pos + count:
+        # Not enough data, return what we can parse
+        count = len(response) - pos
+    
     capabilities: list[int] = []
     for _ in range(count):
         capabilities.append(response[pos])
