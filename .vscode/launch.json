@@ -1,0 +1,48 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Cli",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/python/ifit.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "${workspaceFolder}/python/venv/Scripts/python.exe",
+            "cwd": "${workspaceFolder}/python",
+            "args": ["info", "DE:09:80:3D:3F:0A", "0400EE4490EA42A8"]
+        },
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "${workspaceFolder}/python/venv/Scripts/python.exe",
+            "cwd": "${workspaceFolder}/python",
+            "args": ["info", "DE:09:80:3D:3F:0A", "0400EE4490EA42A8"]
+        },
+        {
+            "name": "Python: Current File (Prompt for Args)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "${workspaceFolder}/python/venv/Scripts/python.exe",
+            "cwd": "${workspaceFolder}/python",
+            "args": "${command:pickArgs}"
+        },
+        {
+            "name": "Python: Module",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "${command:pickArgs}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "${workspaceFolder}/python/venv/Scripts/python.exe",
+            "cwd": "${workspaceFolder}/python"
+        }
+    ]
+}
