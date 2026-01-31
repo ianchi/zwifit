@@ -40,15 +40,15 @@ class Mode(IntEnum):
 class Command(IntEnum):
     """Command identifiers used in request headers."""
 
-    WRITE_AND_READ = 2
-    CALIBRATE = 6
-    SUPPORTED_CAPABILITIES = 128
-    EQUIPMENT_INFORMATION = 129
-    EQUIPMENT_REFERENCE = 130
-    EQUIPMENT_FIRMWARE = 132
-    SUPPORTED_COMMANDS = 136
-    ENABLE = 144
-    EQUIPMENT_SERIAL = 149
+    WRITE_AND_READ = 0x02
+    CALIBRATE = 0x06
+    SUPPORTED_CAPABILITIES = 0x80
+    EQUIPMENT_INFORMATION = 0x81
+    EQUIPMENT_REFERENCE = 0x82
+    EQUIPMENT_FIRMWARE = 0x84
+    SUPPORTED_COMMANDS = 0x88
+    ENABLE = 0x90
+    EQUIPMENT_SERIAL = 0x95
 
 
 class MessageIndex(IntEnum):
@@ -107,73 +107,40 @@ class WriteValue:
     value: Any
 
 
-def _double_from_buffer(buffer: bytes, pos: int) -> float:
-    """Decode a scaled uint16 (two decimals) from the buffer."""
-    return int.from_bytes(buffer[pos : pos + 2], "little") / 100
+def _make_int_converter(size: int, byteorder: str = "little") -> Converter:
+    """Factory for integer converters."""
+    def from_buffer(buffer: bytes, pos: int) -> int:
+        return int.from_bytes(buffer[pos:pos + size], byteorder)
+    
+    def to_buffer(buf: bytearray, pos: int, value: int) -> int:
+        buf[pos:pos + size] = int(value).to_bytes(size, byteorder)
+        return pos + size
+    
+    return Converter(size, from_buffer, to_buffer)
 
 
-def _double_to_buffer(buffer: bytearray, pos: int, value: float) -> int:
-    """Encode a scaled uint16 (two decimals) into the buffer."""
-    scaled = round(value * 100)
-    buffer[pos : pos + 2] = int(scaled).to_bytes(2, "little")
-    return pos + 2
+def _make_scaled_converter(scale: float, size: int = 2) -> Converter:
+    """Factory for scaled numeric converters."""
+    def from_buffer(buffer: bytes, pos: int) -> float:
+        return int.from_bytes(buffer[pos:pos + size], "little") / scale
+    
+    def to_buffer(buf: bytearray, pos: int, value: float) -> int:
+        buf[pos:pos + size] = int(value * scale).to_bytes(size, "little")
+        return pos + size
+    
+    return Converter(size, from_buffer, to_buffer)
 
 
-def _bool_from_buffer(buffer: bytes, pos: int) -> bool:
-    """Decode a boolean flag."""
-    return buffer[pos] == 1
-
-
-def _bool_to_buffer(buffer: bytearray, pos: int, value: bool) -> int:
-    """Encode a boolean flag."""
-    buffer[pos] = 1 if value else 0
-    return pos + 1
-
-
-def _uint8_from_buffer(buffer: bytes, pos: int) -> int:
-    """Decode a uint8."""
-    return buffer[pos]
-
-
-def _uint8_to_buffer(buffer: bytearray, pos: int, value: int) -> int:
-    """Encode a uint8."""
-    buffer[pos] = int(value) & 0xFF
-    return pos + 1
-
-
-def _uint16_from_buffer(buffer: bytes, pos: int) -> int:
-    """Decode a uint16."""
-    return int.from_bytes(buffer[pos : pos + 2], "little")
-
-
-def _uint16_to_buffer(buffer: bytearray, pos: int, value: int) -> int:
-    """Encode a uint16."""
-    buffer[pos : pos + 2] = int(value).to_bytes(2, "little")
-    return pos + 2
-
-
-def _uint32_from_buffer(buffer: bytes, pos: int) -> int:
-    """Decode a uint32."""
-    return int.from_bytes(buffer[pos : pos + 4], "little")
-
-
-def _uint32_to_buffer(buffer: bytearray, pos: int, value: int) -> int:
-    """Encode a uint32."""
-    buffer[pos : pos + 4] = int(value).to_bytes(4, "little")
-    return pos + 4
-
-
-def _calories_from_buffer(buffer: bytes, pos: int) -> float:
-    """Decode calories using the iFit scaling factor."""
-    raw = int.from_bytes(buffer[pos : pos + 4], "little")
-    return raw * 1024 / 100000000
-
-
-def _calories_to_buffer(buffer: bytearray, pos: int, value: float) -> int:
-    """Encode calories using the iFit scaling factor."""
-    raw = int(value * 100000000 / 1024)
-    buffer[pos : pos + 4] = raw.to_bytes(4, "little")
-    return pos + 4
+def _make_bool_converter() -> Converter:
+    """Factory for boolean converters."""
+    def from_buffer(buffer: bytes, pos: int) -> bool:
+        return buffer[pos] == 1
+    
+    def to_buffer(buf: bytearray, pos: int, value: bool) -> int:
+        buf[pos] = 1 if value else 0
+        return pos + 1
+    
+    return Converter(1, from_buffer, to_buffer)
 
 
 def _pulse_from_buffer(buffer: bytes, pos: int) -> dict[str, Any]:
@@ -197,14 +164,14 @@ def _pulse_to_buffer(buffer: bytearray, pos: int, value: Mapping[str, Any]) -> i
 
 
 CONVERTERS = {
-    "double": Converter(2, _double_from_buffer, _double_to_buffer),
-    "boolean": Converter(1, _bool_from_buffer, _bool_to_buffer),
-    "mode": Converter(1, _uint8_from_buffer, _uint8_to_buffer),
-    "calories": Converter(4, _calories_from_buffer, _calories_to_buffer),
+    "double": _make_scaled_converter(100.0),
+    "boolean": _make_bool_converter(),
+    "mode": _make_int_converter(1),
+    "calories": _make_scaled_converter(100000000 / 1024, size=4),
     "pulse": Converter(4, _pulse_from_buffer, _pulse_to_buffer),
-    "one_byte_int": Converter(1, _uint8_from_buffer, _uint8_to_buffer),
-    "two_bytes_int": Converter(2, _uint16_from_buffer, _uint16_to_buffer),
-    "four_bytes_int": Converter(4, _uint32_from_buffer, _uint32_to_buffer),
+    "one_byte_int": _make_int_converter(1),
+    "two_bytes_int": _make_int_converter(2),
+    "four_bytes_int": _make_int_converter(4),
 }
 
 
@@ -534,75 +501,96 @@ def parse_write_and_read_response(
     return result
 
 
-def parse_equipment_firmware_response(response: bytes) -> str | None:
-    """Parse firmware version from EQUIPMENT_FIRMWARE response.
-    
-    Structure:
-    - Bytes 0-10: Header and metadata
-    - Byte 11+: ASCII firmware version string
-    
-    Example: '0.1.06122017.0908'
-    """
-    if len(response) < 12:
+@dataclass
+class _ResponseParser:
+    """Generic response parser configuration."""
+    min_length: int
+    extractor: Callable[[bytes], Any]
+
+
+def _parse_firmware(response: bytes) -> str | None:
+    """Extract firmware version string from response."""
+    firmware_str = response[11:].decode('ascii', errors='ignore')
+    firmware_clean = firmware_str.split('\x01')[0].split('\x00')[0]
+    return firmware_clean if firmware_clean else None
+
+
+def _parse_reference(response: bytes) -> int:
+    """Extract reference number from response."""
+    return int.from_bytes(response[15:19], 'little')
+
+
+def _parse_serial(response: bytes) -> str | None:
+    """Extract serial number from response."""
+    serial_length = response[8]
+    if len(response) < 9 + serial_length:
         return None
-    
+    serial_bytes = response[9:9 + serial_length]
+    serial_number = serial_bytes.decode('ascii', errors='ignore').strip()
+    return serial_number if serial_number else None
+
+
+_RESPONSE_PARSERS = {
+    Command.EQUIPMENT_FIRMWARE: _ResponseParser(12, _parse_firmware),
+    Command.EQUIPMENT_REFERENCE: _ResponseParser(19, _parse_reference),
+    Command.EQUIPMENT_SERIAL: _ResponseParser(10, _parse_serial),
+}
+
+
+def _parse_metadata_response(response: bytes, command: Command) -> Any:
+    """Unified response parser for metadata commands."""
+    parser = _RESPONSE_PARSERS.get(command)
+    if not parser or len(response) < parser.min_length:
+        return None
     try:
-        # Firmware string starts at byte 11
-        firmware_bytes = response[11:]
-        # Decode and stop at first control character (like \x01)
-        firmware_str = firmware_bytes.decode('ascii', errors='ignore')
-        # Split at control characters and take first part
-        firmware_clean = firmware_str.split('\x01')[0].split('\x00')[0]
-        return firmware_clean if firmware_clean else None
+        return parser.extractor(response)
     except Exception:
         return None
+
+
+def parse_equipment_firmware_response(response: bytes) -> str | None:
+    """Parse firmware version from EQUIPMENT_FIRMWARE response."""
+    return _parse_metadata_response(response, Command.EQUIPMENT_FIRMWARE)
 
 
 def parse_equipment_reference_response(response: bytes) -> int | None:
-    """Parse reference number from EQUIPMENT_REFERENCE response.
-    
-    Structure:
-    - Bytes 0-14: Header and other data
-    - Bytes 15-18: Reference number (little-endian 4-byte int)
-    
-    Example: 392748
-    """
-    if len(response) < 19:
-        return None
-    
-    try:
-        # Reference number is at bytes 15-18 (little-endian)
-        reference = int.from_bytes(response[15:19], 'little')
-        return reference
-    except Exception:
-        return None
+    """Parse reference number from EQUIPMENT_REFERENCE response."""
+    return _parse_metadata_response(response, Command.EQUIPMENT_REFERENCE)
 
 
 def parse_equipment_serial_response(response: bytes) -> str | None:
-    """Parse serial number from EQUIPMENT_SERIAL response.
-    
-    Structure:
-    - Bytes 0-7: Header
-    - Byte 8: Length of serial number string
-    - Bytes 9-(9+length-1): Serial number (ASCII)
-    - Last byte: Checksum
-    
-    Example: '392747-MM74Y102555'
-    """
-    if len(response) < 10:
-        return None
-    
-    try:
-        # Byte 8 contains the length of the serial number
-        serial_length = response[8]
-        
-        # Serial number starts at byte 9
-        if len(response) < 9 + serial_length:
-            return None
-            
-        serial_bytes = response[9:9 + serial_length]
-        serial_number = serial_bytes.decode('ascii', errors='ignore').strip()
-        
-        return serial_number if serial_number else None
-    except Exception:
-        return None
+    """Parse serial number from EQUIPMENT_SERIAL response."""
+    return _parse_metadata_response(response, Command.EQUIPMENT_SERIAL)
+
+
+def validate_checksum(response: bytes) -> None:
+    """Validate the response checksum; raises on mismatch."""
+    if len(response) <= 5:
+        return
+    checksum = sum(response[4:-1]) & 0xFF
+    if checksum != response[-1]:
+        raise ValueError("checksum invalid")
+
+
+@dataclass
+class CommandConfig:
+    """Configuration for equipment command queries."""
+    command: Command
+    parser: Callable[[bytes], Any]
+    store_in: str  # Field name in EquipmentInformation to store result
+    payload: bytes = b""  # Payload to send with command
+    check_supported: bool = True  # Whether to check if command is supported first
+
+
+# Core initialization commands - always executed
+CORE_COMMANDS = [
+    CommandConfig(Command.SUPPORTED_CAPABILITIES, parse_features_response, "supported_capabilities", check_supported=False),
+    CommandConfig(Command.SUPPORTED_COMMANDS, parse_features_response, "supported_commands", check_supported=False),
+]
+
+# Metadata commands - only executed if supported
+METADATA_COMMANDS = [
+    CommandConfig(Command.EQUIPMENT_REFERENCE, parse_equipment_reference_response, "reference_number", b"\x00\x00"),
+    CommandConfig(Command.EQUIPMENT_FIRMWARE, parse_equipment_firmware_response, "firmware_version", b"\x00\x00"),
+    CommandConfig(Command.EQUIPMENT_SERIAL, parse_equipment_serial_response, "serial_number", b"\x00\x00"),
+]

@@ -5,18 +5,20 @@ import csv
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncGenerator, Iterable
+from typing import Any, AsyncGenerator, Callable, Iterable
 
 from bleak import BleakClient
 
 from .protocol import (
     BLE_UUIDS,
-    CAPABILITIES,
     CHARACTERISTICS,
     CHARACTERISTICS_BY_ID,
+    CORE_COMMANDS,
     Command,
+    CommandConfig,
     CharacteristicDefinition,
     EquipmentInformation,
+    METADATA_COMMANDS,
     MessageIndex,
     SportsEquipment,
     WriteValue,
@@ -34,8 +36,8 @@ from .protocol import (
     parse_equipment_serial_response,
     parse_features_response,
     parse_write_and_read_response,
+    validate_checksum,
 )
-from .hardcoded_init import INIT_SEQUENCES
 
 
 LOGGER = logging.getLogger(__name__)
@@ -57,7 +59,6 @@ class IFitBleClient:
         address: str,
         activation_code: str | None = None,
         *,
-        model: str | None = None,
         response_timeout: float = 10.0,
     ) -> None:
         """Create a client bound to a BLE device address.
@@ -65,23 +66,14 @@ class IFitBleClient:
         Args:
             address: BLE MAC address of the device
             activation_code: 8-byte hex activation code (optional - enables control if provided)
-            model: Model name for hardcoded initialization (optional if activation_code is provided)
             response_timeout: Timeout for responses in seconds
         
         Notes:
-            - No activation_code/model: Monitor-only mode (NongoFit-style read-only, no discovery)
-            - With activation_code only: Discovery + control mode (commands 81-95 + 90)
-            - With model only: Uses hardcoded initialization sequences
-            - With both: Invalid (cannot specify both activation_code and model)
+            - No activation_code: Monitor-only mode (read-only, no discovery)
+            - With activation_code: Discovery + control mode (full commands)
         """
-        if activation_code is not None and model is not None:
-            raise ValueError("Cannot specify both activation_code and model")
-        if model is not None and model not in INIT_SEQUENCES:
-            raise ValueError(f"Model '{model}' not found in INIT_SEQUENCES")
-        
         self.address = address
         self.activation_code = activation_code
-        self.model = model
         self.response_timeout = response_timeout
         self._client = BleakClient(address)
         self._equipment_information: EquipmentInformation | None = None
@@ -93,6 +85,26 @@ class IFitBleClient:
     def equipment_information(self) -> EquipmentInformation | None:
         """Return cached equipment information when available."""
         return self._equipment_information
+
+    def _load_activation_codes(self, codes_file: Path) -> list[tuple[str, str]]:
+        """Load activation codes from CSV file."""
+        with open(codes_file, "r", encoding="utf-8") as f:
+            return [(row[0].strip(), row[1].strip().split(";")[0]) 
+                    for row in csv.reader(f) if len(row) >= 2]
+
+    async def _try_single_code(self, code: str) -> bool:
+        """Test if a single activation code works."""
+        self.activation_code = code
+        try:
+            await self._enable_equipment()
+            await asyncio.wait_for(
+                self.read_characteristics(["MaxIncline", "MinIncline"]), 
+                timeout=2.0
+            )
+            return True
+        except (asyncio.TimeoutError, Exception) as e:
+            LOGGER.debug(f"Code verification failed: {e}")
+            return False
 
     async def try_activation_codes(
         self,
@@ -124,7 +136,6 @@ class IFitBleClient:
         """
         # Load activation codes from CSV
         if codes_file is None:
-            # Default to codes_reverse.csv in the python directory
             module_dir = Path(__file__).parent.parent
             codes_file = module_dir / "codes_reverse.csv"
         
@@ -132,17 +143,7 @@ class IFitBleClient:
         if not codes_file.exists():
             raise FileNotFoundError(f"Activation codes file not found: {codes_file}")
         
-        activation_codes: list[tuple[str, str]] = []
-        with open(codes_file, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if len(row) >= 2:
-                    # Use the full activation code from CSV (variable length)
-                    code = row[0].strip()
-                    # Handle multiple model names separated by semicolon
-                    model = row[1].strip().split(";")[0]
-                    activation_codes.append((code, model))
-        
+        activation_codes = self._load_activation_codes(codes_file)
         if not activation_codes:
             raise ValueError(f"No activation codes found in {codes_file}")
         
@@ -159,31 +160,9 @@ class IFitBleClient:
         for i, (code, model) in enumerate(codes_to_try, 1):
             LOGGER.info(f"Trying activation code {i}/{len(codes_to_try)}: {model}")
             
-            try:
-                # Temporarily set the activation code
-                self.activation_code = code
-                
-                # Try to enable equipment with this code
-                await self._enable_equipment()
-                
-                # Verify activation by trying to read a characteristic
-                # If the code is wrong, this will likely fail or timeout
-                try:
-                    await asyncio.wait_for(
-                        self.read_characteristics(["MaxIncline", "MinIncline"]),
-                        timeout=2.0
-                    )
-                    # Success! The code worked
-                    LOGGER.info(f"✓ Activation successful with code for {model}")
-                    return code, model
-                    
-                except (asyncio.TimeoutError, Exception) as e:
-                    LOGGER.debug(f"Code verification failed for {model}: {e}")
-                    continue
-                    
-            except Exception as e:
-                LOGGER.debug(f"Activation failed for {model}: {e}")
-                continue
+            if await self._try_single_code(code):
+                LOGGER.info(f"✓ Activation successful with code for {model}")
+                return code, model
         
         # If we get here, no code worked
         self.activation_code = None
@@ -222,156 +201,51 @@ class IFitBleClient:
             await self._client.stop_notify(BLE_UUIDS["rx"])
             await self._client.disconnect()
 
+    async def _execute_command_configs(self, configs: list[CommandConfig]) -> None:
+        """Execute a list of command configurations."""
+        if not self._equipment_information:
+            raise ValueError("Cannot execute commands: equipment information not initialized")
+        
+        for config in configs:
+            # Check if command is supported (if required)
+            if config.check_supported and config.command not in self._equipment_information.supported_commands:
+                LOGGER.debug(f"Command {config.command.name} not supported, skipping")
+                continue
+            
+            try:
+                _, response = await self._send_command(config.command, config.payload)
+                value = config.parser(response)
+                if value is not None:
+                    setattr(self._equipment_information, config.store_in, value)
+                    LOGGER.info(f"{config.store_in.replace('_', ' ').title()}: {value}")
+            except Exception as e:
+                LOGGER.warning(f"Could not get {config.command.name}: {e}")
+    
     async def _initialize_equipment(self) -> None:
-        """Load equipment metadata and discover capabilities.
-        
-        Runs the standard discovery sequence:
-        - 81: EQUIPMENT_INFORMATION
-        - 80: SUPPORTED_CAPABILITIES
-        - 88: SUPPORTED_COMMANDS
-        - 82: EQUIPMENT_REFERENCE
-        - 84: EQUIPMENT_FIRMWARE
-        - 95: EQUIPMENT_SERIAL
-        """
-
-        # Use hardcoded sequence if model is specified
-        if self.model is not None:
-            await self._initialize_with_hardcoded_sequence()
-            return
-        
-        # Standard initialization sequence
-        # Command 81: EQUIPMENT_INFORMATION
+        """Load equipment metadata using discovery or monitor-only mode."""
+        # Run discovery initialization
+        # Command 81: EQUIPMENT_INFORMATION - must be first to create the object
         header, response = await self._send_command(Command.EQUIPMENT_INFORMATION)
         characteristics = parse_equipment_information_response(response)
-        equipment_info = EquipmentInformation(
+        self._equipment_information = EquipmentInformation(
             equipment=SportsEquipment(header["equipment"]),
             characteristics=characteristics,
         )
         
-        # Store equipment information
-        self._equipment_information = equipment_info
+        # Execute core initialization commands
+        await self._execute_command_configs(CORE_COMMANDS)
         
-        # Command 80: SUPPORTED_CAPABILITIES
-        _, response = await self._send_command(Command.SUPPORTED_CAPABILITIES)
-        equipment_info.supported_capabilities = parse_features_response(response)
+        # Query metadata
+        await self._execute_command_configs(METADATA_COMMANDS)
         
-        # Command 88: SUPPORTED_COMMANDS - get list of supported commands
-        try:
-            _, response = await self._send_command(Command.SUPPORTED_COMMANDS)
-            equipment_info.supported_commands = parse_features_response(response)
-            LOGGER.debug(f"Supported commands: {equipment_info.supported_commands}")
-        except Exception as e:
-            LOGGER.warning(f"Could not get supported commands: {e}")
-        
-        # Query additional equipment information commands if supported
-        for cmd in [Command.EQUIPMENT_REFERENCE, Command.EQUIPMENT_FIRMWARE, Command.EQUIPMENT_SERIAL]:
-            if cmd in equipment_info.supported_commands:
-                try:
-                    _, response = await self._send_command(cmd, b"\x00\x00")
-                    LOGGER.debug(f"{cmd.name}: {response.hex()}")
-                    
-                    # Parse reference number
-                    if cmd == Command.EQUIPMENT_REFERENCE:
-                        reference = parse_equipment_reference_response(response)
-                        if reference:
-                            equipment_info.reference_number = reference
-                            LOGGER.info(f"Reference number: {reference}")
-                    
-                    # Parse firmware version
-                    elif cmd == Command.EQUIPMENT_FIRMWARE:
-                        firmware = parse_equipment_firmware_response(response)
-                        if firmware:
-                            equipment_info.firmware_version = firmware
-                            LOGGER.info(f"Firmware version: {firmware}")
-                    
-                    # Parse serial number
-                    elif cmd == Command.EQUIPMENT_SERIAL:
-                        serial = parse_equipment_serial_response(response)
-                        if serial:
-                            equipment_info.serial_number = serial
-                            LOGGER.info(f"Serial number: {serial}")
-                    
-                except Exception as e:
-                    LOGGER.warning(f"Could not get {cmd.name}: {e}")
-            else:
-                LOGGER.debug(f"Command {cmd.name} not supported, skipping")
-        
+        max_min = await self.read_characteristics(
+                ["MaxIncline", "MinIncline", "MaxKph", "MinKph", "MaxPulse", "Metric"]
+            )
+        self._equipment_information.values.update(max_min)
 
-        
-        # Enable equipment with activation code if provided
-        if self.activation_code is not None:
+        # Enable if activation code provided
+        if self.activation_code:
             await self._enable_equipment()
-            
-            # Read min/max values after enabling
-            max_min = await self.read_characteristics(
-                [
-                    "MaxIncline",
-                    "MinIncline",
-                    "MaxKph",
-                    "MinKph",
-                    "MaxPulse",
-                    "Metric",
-                ]
-            )
-            equipment_info.values.update(max_min)
-    
-    async def _initialize_with_hardcoded_sequence(self) -> None:
-        """Initialize using hardcoded byte sequences for this model."""
-        LOGGER.info(f"Initializing with hardcoded sequence for model: {self.model}")
-        
-        sequences = INIT_SEQUENCES[self.model]
-        for i, sequence in enumerate(sequences, 1):
-            LOGGER.debug(f"Sending sequence {i}/{len(sequences)}: {sequence.hex()}")
-            await self._client.write_gatt_char(BLE_UUIDS["tx"], sequence, response=False)
-            await asyncio.sleep(0.3)
-        
-        LOGGER.info("Hardcoded sequence initialization complete")
-        
-        # Try to get equipment information for metadata
-        # This may or may not work depending on the sequence
-        try:
-            header, response = await self._send_command(Command.EQUIPMENT_INFORMATION)
-            characteristics = parse_equipment_information_response(response)
-            self._equipment_information = EquipmentInformation(
-                equipment=SportsEquipment(header["equipment"]),
-                characteristics=characteristics,
-            )
-            
-            # Try to get serial and firmware if available
-            try:
-                _, response = await self._send_command(Command.EQUIPMENT_REFERENCE, b"\x00\x00")
-                reference = parse_equipment_reference_response(response)
-                if reference:
-                    self._equipment_information.reference_number = reference
-                    LOGGER.info(f"Reference number: {reference}")
-            except Exception:
-                pass
-            
-            try:
-                _, response = await self._send_command(Command.EQUIPMENT_FIRMWARE, b"\x00\x00")
-                firmware = parse_equipment_firmware_response(response)
-                if firmware:
-                    self._equipment_information.firmware_version = firmware
-                    LOGGER.info(f"Firmware version: {firmware}")
-            except Exception:
-                pass
-            
-            try:
-                _, response = await self._send_command(Command.EQUIPMENT_SERIAL, b"\x00\x00")
-                serial = parse_equipment_serial_response(response)
-                if serial:
-                    self._equipment_information.serial_number = serial
-                    LOGGER.info(f"Serial number: {serial}")
-            except Exception:
-                pass
-                
-        except Exception as e:
-            LOGGER.warning(f"Could not get equipment info after hardcoded init: {e}")
-            # Create a minimal equipment info object
-            self._equipment_information = EquipmentInformation(
-                equipment=SportsEquipment.GENERAL,
-                characteristics=[],
-            )
 
     async def _send_command(
         self,
@@ -410,7 +284,18 @@ class IFitBleClient:
         """Write characteristics and return requested read values."""
         info = self._require_equipment_info()
         write_values = list(writes) if writes else []
-        read_defs = [self._coerce_characteristic(item) for item in reads]
+        
+        # Convert characteristic names/ids to definitions
+        read_defs = []
+        for item in reads:
+            if isinstance(item, int):
+                if item not in CHARACTERISTICS_BY_ID:
+                    raise ValueError(f"Unknown characteristic id: {item}")
+                read_defs.append(CHARACTERISTICS_BY_ID[item])
+            else:
+                if item not in CHARACTERISTICS:
+                    raise ValueError(f"Unknown characteristic name: {item}")
+                read_defs.append(CHARACTERISTICS[item])
 
         write_payload = get_bitmap(info, write_values)
         read_payload = get_bitmap(info, read_defs)
@@ -432,10 +317,11 @@ class IFitBleClient:
 
     async def write_characteristics(self, values: dict[str, Any]) -> None:
         """Write characteristic values by name."""
-        writes = [
-            WriteValue(self._coerce_characteristic(key), value)
-            for key, value in values.items()
-        ]
+        writes = []
+        for key, value in values.items():
+            if key not in CHARACTERISTICS:
+                raise ValueError(f"Unknown characteristic name: {key}")
+            writes.append(WriteValue(CHARACTERISTICS[key], value))
         await self.write_and_read(writes, [])
 
     async def read_current_values(self) -> dict[str, Any]:
@@ -460,35 +346,15 @@ class IFitBleClient:
         """
         await self.write_characteristics({"Incline": percent})
     
-    async def monitor_basic_state(self) -> AsyncGenerator[dict[str, Any], None]:
+    async def monitor_basic_state(self, interval: float=5.0, count: int=5) -> AsyncGenerator[dict[str, Any], None]:
         """Read basic monitoring values in a loop."""
         
-        for _ in range(5):  # Example: read 5 times
+        for _ in range(count):  # Example: read 5 times
             result = await self.read_current_values()
             yield result
 
-            await asyncio.sleep(5.0)  # Wait 5 seconds between reads
+            await asyncio.sleep(interval)  # Wait specified interval between reads
         
-
-    async def get_supported_commands(
-        self, equipment: SportsEquipment | None = None
-    ) -> list[int]:
-        """Return supported command ids for the given equipment."""
-        equipment_value = equipment or self._require_equipment_info().equipment
-        request = build_request(equipment_value, Command.SUPPORTED_COMMANDS)
-        response = await self._send_request(request)
-        parse_command_header(response, Command.SUPPORTED_COMMANDS)
-        return parse_features_response(response)
-
-    async def get_equipment_information2(self) -> bytes:
-        """Fetch additional equipment information response bytes."""
-        request = build_request(
-            SportsEquipment.GENERAL, Command.EQUIPMENT_INFORMATION2, b"\x00\x00"
-        )
-        response = await self._send_request(request)
-        parse_command_header(response, Command.EQUIPMENT_INFORMATION2)
-        return response
-
     async def calibrate_incline(self) -> None:
         """Request incline calibration on the treadmill."""
         await self._send_command(Command.CALIBRATE, b"\x00")
@@ -534,7 +400,7 @@ class IFitBleClient:
 
             if message_index == MessageIndex.EOF:
                 response = bytes(self._response_state.buffer)
-                self._validate_checksum(response)
+                validate_checksum(response)
                 self._response_future.set_result(response)
         except Exception as exc:  # pragma: no cover - defensive guard
             self._response_future.set_exception(exc)
@@ -544,22 +410,3 @@ class IFitBleClient:
         if self._equipment_information is None:
             raise ValueError("Equipment information not available. Call connect() first.")
         return self._equipment_information
-
-    def _coerce_characteristic(self, item: str | int) -> CharacteristicDefinition:
-        """Convert a characteristic name or id to a CharacteristicDefinition."""
-        if isinstance(item, int):
-            if item not in CHARACTERISTICS_BY_ID:
-                raise ValueError(f"Unknown characteristic id: {item}")
-            return CHARACTERISTICS_BY_ID[item]
-        if item not in CHARACTERISTICS:
-            raise ValueError(f"Unknown characteristic name: {item}")
-        return CHARACTERISTICS[item]
-
-    @staticmethod
-    def _validate_checksum(response: bytes) -> None:
-        """Validate the response checksum; raises on mismatch."""
-        if len(response) <= 5:
-            return
-        checksum = sum(response[4:-1]) & 0xFF
-        if checksum != response[-1]:
-            raise ValueError("checksum invalid")
