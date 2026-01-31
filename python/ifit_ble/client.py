@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncGenerator, Iterable
 
 from bleak import BleakClient
@@ -27,6 +29,9 @@ from .protocol import (
     get_write_values,
     parse_command_header,
     parse_equipment_information_response,
+    parse_equipment_reference_response,
+    parse_equipment_firmware_response,
+    parse_equipment_serial_response,
     parse_features_response,
     parse_write_and_read_response,
 )
@@ -89,6 +94,104 @@ class IFitBleClient:
         """Return cached equipment information when available."""
         return self._equipment_information
 
+    async def try_activation_codes(
+        self,
+        codes_file: str | Path | None = None,
+        max_attempts: int | None = None,
+    ) -> tuple[str, str]:
+        """Try all activation codes until one successfully activates the equipment.
+        
+        This method connects to the device and attempts activation with each code
+        from the codes file until one succeeds. The device remains connected after
+        successful activation.
+        
+        Args:
+            codes_file: Path to CSV file with activation codes. If None, uses
+                       codes_reverse.csv in the same directory as this module.
+            max_attempts: Maximum number of codes to try. If None, tries all codes.
+        
+        Returns:
+            Tuple of (successful_activation_code, model_name)
+        
+        Raises:
+            ValueError: If no activation code works
+            FileNotFoundError: If codes file doesn't exist
+            
+        Example:
+            >>> client = IFitBleClient("AA:BB:CC:DD:EE:FF")
+            >>> code, model = await client.try_activation_codes()
+            >>> print(f"Activated with {model}: {code}")
+        """
+        # Load activation codes from CSV
+        if codes_file is None:
+            # Default to codes_reverse.csv in the python directory
+            module_dir = Path(__file__).parent.parent
+            codes_file = module_dir / "codes_reverse.csv"
+        
+        codes_file = Path(codes_file)
+        if not codes_file.exists():
+            raise FileNotFoundError(f"Activation codes file not found: {codes_file}")
+        
+        activation_codes: list[tuple[str, str]] = []
+        with open(codes_file, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 2:
+                    # Use the full activation code from CSV (variable length)
+                    code = row[0].strip()
+                    # Handle multiple model names separated by semicolon
+                    model = row[1].strip().split(";")[0]
+                    activation_codes.append((code, model))
+        
+        if not activation_codes:
+            raise ValueError(f"No activation codes found in {codes_file}")
+        
+        LOGGER.info(f"Loaded {len(activation_codes)} activation codes from {codes_file}")
+        
+        # Limit attempts if specified
+        codes_to_try = activation_codes[:max_attempts] if max_attempts else activation_codes
+        
+        # Connect to device if not already connected
+        if not self._client.is_connected:
+            await self.connect()
+        
+        # Try each activation code
+        for i, (code, model) in enumerate(codes_to_try, 1):
+            LOGGER.info(f"Trying activation code {i}/{len(codes_to_try)}: {model}")
+            
+            try:
+                # Temporarily set the activation code
+                self.activation_code = code
+                
+                # Try to enable equipment with this code
+                await self._enable_equipment()
+                
+                # Verify activation by trying to read a characteristic
+                # If the code is wrong, this will likely fail or timeout
+                try:
+                    await asyncio.wait_for(
+                        self.read_characteristics(["MaxIncline", "MinIncline"]),
+                        timeout=2.0
+                    )
+                    # Success! The code worked
+                    LOGGER.info(f"✓ Activation successful with code for {model}")
+                    return code, model
+                    
+                except (asyncio.TimeoutError, Exception) as e:
+                    LOGGER.debug(f"Code verification failed for {model}: {e}")
+                    continue
+                    
+            except Exception as e:
+                LOGGER.debug(f"Activation failed for {model}: {e}")
+                continue
+        
+        # If we get here, no code worked
+        self.activation_code = None
+        raise ValueError(
+            f"Failed to activate equipment. Tried {len(codes_to_try)} codes with no success. "
+            "The device may not be supported or may require a different activation method."
+        )
+
     async def connect(self) -> None:
         """Connect to the BLE device and initialize protocol state."""
         await self._client.connect()
@@ -126,9 +229,9 @@ class IFitBleClient:
         - 81: EQUIPMENT_INFORMATION
         - 80: SUPPORTED_CAPABILITIES
         - 88: SUPPORTED_COMMANDS
-        - 82: EQUIPMENT_INFORMATION2
-        - 84: EQUIPMENT_INFORMATION3
-        - 95: EQUIPMENT_INFORMATION4
+        - 82: EQUIPMENT_REFERENCE
+        - 84: EQUIPMENT_FIRMWARE
+        - 95: EQUIPMENT_SERIAL
         """
 
         # Use hardcoded sequence if model is specified
@@ -161,11 +264,33 @@ class IFitBleClient:
             LOGGER.warning(f"Could not get supported commands: {e}")
         
         # Query additional equipment information commands if supported
-        for cmd in [Command.EQUIPMENT_INFORMATION2, Command.EQUIPMENT_INFORMATION3, Command.EQUIPMENT_INFORMATION4]:
+        for cmd in [Command.EQUIPMENT_REFERENCE, Command.EQUIPMENT_FIRMWARE, Command.EQUIPMENT_SERIAL]:
             if cmd in equipment_info.supported_commands:
                 try:
                     _, response = await self._send_command(cmd, b"\x00\x00")
                     LOGGER.debug(f"{cmd.name}: {response.hex()}")
+                    
+                    # Parse reference number
+                    if cmd == Command.EQUIPMENT_REFERENCE:
+                        reference = parse_equipment_reference_response(response)
+                        if reference:
+                            equipment_info.reference_number = reference
+                            LOGGER.info(f"Reference number: {reference}")
+                    
+                    # Parse firmware version
+                    elif cmd == Command.EQUIPMENT_FIRMWARE:
+                        firmware = parse_equipment_firmware_response(response)
+                        if firmware:
+                            equipment_info.firmware_version = firmware
+                            LOGGER.info(f"Firmware version: {firmware}")
+                    
+                    # Parse serial number
+                    elif cmd == Command.EQUIPMENT_SERIAL:
+                        serial = parse_equipment_serial_response(response)
+                        if serial:
+                            equipment_info.serial_number = serial
+                            LOGGER.info(f"Serial number: {serial}")
+                    
                 except Exception as e:
                     LOGGER.warning(f"Could not get {cmd.name}: {e}")
             else:
@@ -175,7 +300,7 @@ class IFitBleClient:
         
         # Enable equipment with activation code if provided
         if self.activation_code is not None:
-            await self._enable_equipment(equipment_info)
+            await self._enable_equipment()
             
             # Read min/max values after enabling
             max_min = await self.read_characteristics(
@@ -211,6 +336,35 @@ class IFitBleClient:
                 equipment=SportsEquipment(header["equipment"]),
                 characteristics=characteristics,
             )
+            
+            # Try to get serial and firmware if available
+            try:
+                _, response = await self._send_command(Command.EQUIPMENT_REFERENCE, b"\x00\x00")
+                reference = parse_equipment_reference_response(response)
+                if reference:
+                    self._equipment_information.reference_number = reference
+                    LOGGER.info(f"Reference number: {reference}")
+            except Exception:
+                pass
+            
+            try:
+                _, response = await self._send_command(Command.EQUIPMENT_FIRMWARE, b"\x00\x00")
+                firmware = parse_equipment_firmware_response(response)
+                if firmware:
+                    self._equipment_information.firmware_version = firmware
+                    LOGGER.info(f"Firmware version: {firmware}")
+            except Exception:
+                pass
+            
+            try:
+                _, response = await self._send_command(Command.EQUIPMENT_SERIAL, b"\x00\x00")
+                serial = parse_equipment_serial_response(response)
+                if serial:
+                    self._equipment_information.serial_number = serial
+                    LOGGER.info(f"Serial number: {serial}")
+            except Exception:
+                pass
+                
         except Exception as e:
             LOGGER.warning(f"Could not get equipment info after hardcoded init: {e}")
             # Create a minimal equipment info object

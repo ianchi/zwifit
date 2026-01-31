@@ -44,11 +44,11 @@ class Command(IntEnum):
     CALIBRATE = 6
     SUPPORTED_CAPABILITIES = 128
     EQUIPMENT_INFORMATION = 129
-    EQUIPMENT_INFORMATION2 = 130
-    EQUIPMENT_INFORMATION3 = 132
+    EQUIPMENT_REFERENCE = 130
+    EQUIPMENT_FIRMWARE = 132
     SUPPORTED_COMMANDS = 136
     ENABLE = 144
-    EQUIPMENT_INFORMATION4 = 149
+    EQUIPMENT_SERIAL = 149
 
 
 class MessageIndex(IntEnum):
@@ -94,6 +94,9 @@ class EquipmentInformation:
     supported_capabilities: list[int] = field(default_factory=list)
     supported_commands: list[int] = field(default_factory=list)
     values: dict[str, Any] = field(default_factory=dict)
+    serial_number: str | None = None
+    firmware_version: str | None = None
+    reference_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -529,3 +532,77 @@ def parse_write_and_read_response(
             result[characteristic.name] = converter.from_buffer(response, pos)
             pos += converter.size
     return result
+
+
+def parse_equipment_firmware_response(response: bytes) -> str | None:
+    """Parse firmware version from EQUIPMENT_FIRMWARE response.
+    
+    Structure:
+    - Bytes 0-10: Header and metadata
+    - Byte 11+: ASCII firmware version string
+    
+    Example: '0.1.06122017.0908'
+    """
+    if len(response) < 12:
+        return None
+    
+    try:
+        # Firmware string starts at byte 11
+        firmware_bytes = response[11:]
+        # Decode and stop at first control character (like \x01)
+        firmware_str = firmware_bytes.decode('ascii', errors='ignore')
+        # Split at control characters and take first part
+        firmware_clean = firmware_str.split('\x01')[0].split('\x00')[0]
+        return firmware_clean if firmware_clean else None
+    except Exception:
+        return None
+
+
+def parse_equipment_reference_response(response: bytes) -> int | None:
+    """Parse reference number from EQUIPMENT_REFERENCE response.
+    
+    Structure:
+    - Bytes 0-14: Header and other data
+    - Bytes 15-18: Reference number (little-endian 4-byte int)
+    
+    Example: 392748
+    """
+    if len(response) < 19:
+        return None
+    
+    try:
+        # Reference number is at bytes 15-18 (little-endian)
+        reference = int.from_bytes(response[15:19], 'little')
+        return reference
+    except Exception:
+        return None
+
+
+def parse_equipment_serial_response(response: bytes) -> str | None:
+    """Parse serial number from EQUIPMENT_SERIAL response.
+    
+    Structure:
+    - Bytes 0-7: Header
+    - Byte 8: Length of serial number string
+    - Bytes 9-(9+length-1): Serial number (ASCII)
+    - Last byte: Checksum
+    
+    Example: '392747-MM74Y102555'
+    """
+    if len(response) < 10:
+        return None
+    
+    try:
+        # Byte 8 contains the length of the serial number
+        serial_length = response[8]
+        
+        # Serial number starts at byte 9
+        if len(response) < 9 + serial_length:
+            return None
+            
+        serial_bytes = response[9:9 + serial_length]
+        serial_number = serial_bytes.decode('ascii', errors='ignore').strip()
+        
+        return serial_number if serial_number else None
+    except Exception:
+        return None

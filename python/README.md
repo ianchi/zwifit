@@ -37,7 +37,26 @@ ifit discover 1a2b
 
 ### Discover Activation Code
 
-**New!** Automatically discover the activation code by intercepting it from the manufacturer's app:
+**Method 1: Automatic Discovery (Try All Codes)**
+
+The easiest way - automatically try all known activation codes until one works:
+
+```python
+from ifit_ble import IFitBleClient
+
+client = IFitBleClient("AA:BB:CC:DD:EE:FF")
+code, model = await client.try_activation_codes()
+print(f"Activated {model} with code: {code}")
+
+# Now use the client normally
+values = await client.read_current_values()
+```
+
+See [AUTO_ACTIVATION.md](AUTO_ACTIVATION.md) for complete documentation.
+
+**Method 2: BLE Proxy (Intercept from App)**
+
+Capture the activation code by intercepting it from the manufacturer's app:
 
 ```bash
 ifit discover-activation 1a2b
