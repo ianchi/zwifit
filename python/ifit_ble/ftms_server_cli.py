@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+# DEPRECATED: This module is deprecated in favor of the generalized CLI.
+# Use `ifit ftms` command instead:
+#   ifit ftms <address> <activation_code> --name "iFit FTMS" --interval 1.0
+#
+# For installation: pip install -e .
+# For more commands: ifit --help
+
 import argparse
 import asyncio
 import logging

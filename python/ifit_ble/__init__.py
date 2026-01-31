@@ -12,6 +12,13 @@ from .protocol import (
 )
 from .scanner import IFitDevice, find_ifit_device
 
+# Optional activation discovery
+try:
+    from .activation_discovery import discover_activation_code
+    __activation_available = True
+except ImportError:
+    __activation_available = False
+
 __all__ = [
     "BLE_UUIDS",
     "CAPABILITIES",
@@ -26,3 +33,7 @@ __all__ = [
     "WriteValue",
     "find_ifit_device",
 ]
+
+if __activation_available:
+    __all__.append("discover_activation_code")
+
